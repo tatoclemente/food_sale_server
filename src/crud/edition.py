@@ -1,12 +1,13 @@
 import logging
-from typing import Any, Dict, Optional
+from typing import Optional
 from sqlalchemy import or_, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from fastapi import HTTPException, status
 
-from models.edition import Edition
-from schemas.edition import EditionCreate, EditionUpdate, EditionRead
+from models.edition import Edition # pylint: disable=import-error
+from models.sale import Sale # pylint: disable=import-error
+from schemas.edition import EditionCreate, EditionListResponse, EditionUpdate, EditionRead # pylint: disable=import-error
 
 logger = logging.getLogger(__name__)
 
@@ -16,31 +17,44 @@ def get_editions(
     q: Optional[str] = None,
     limit: int = 100,
     offset: int = 0
-) -> Dict[str, Any]:
+) -> EditionListResponse:
     """
     Búsqueda con paginación (limit/offset) y total.
+    Además incluye sales_count (suma de total_portions) por edición.
     Retorna dict con keys: items, total, limit, offset, next_offset, prev_offset
     """
     try:
-        stmt = select(Edition)
+        # construir filtros base
+        filters = []
         if q:
             term = f"%{q.strip()}%"
-            stmt = stmt.where(
-                or_(
-                    Edition.name.ilike(term),
-                    Edition.notes.ilike(term)
-                )
-            )
+            filters.append(or_(Edition.name.ilike(term), Edition.notes.ilike(term)))
 
-        # total
-        count_stmt = select(func.count()).select_from(stmt.subquery()) # pylint: disable=not-callable
+        # total (sobre la consulta filtrada)
+        base_count_stmt = select(Edition).where(*filters) if filters else select(Edition)
+        count_stmt = select(func.count()).select_from(base_count_stmt.subquery())  # pylint: disable=not-callable
         total = db.execute(count_stmt).scalar_one()
 
-        # filas
-        rows_stmt = stmt.order_by(Edition.date.desc()).offset(offset).limit(limit)
-        rows = db.execute(rows_stmt).scalars().all()
+        # agregamos la agregación: SUM of total_portions
 
-        items = [EditionRead.model_validate(r) for r in rows]
+        # use COALESCE to return 0 when there are no sales
+        portions_sum = func.coalesce(func.sum(Sale.total_portions), 0).label("sales_count")
+
+        rows_stmt = (
+            select(Edition, portions_sum)
+            .outerjoin(Sale, Sale.edition_id == Edition.id)
+            .where(*filters) if filters else select(Edition, portions_sum).outerjoin(Sale, Sale.edition_id == Edition.id)
+        )
+
+        rows_stmt = rows_stmt.group_by(Edition.id).order_by(Edition.date.desc()).offset(offset).limit(limit)
+
+        result = db.execute(rows_stmt).all()  # lista de tuples (Edition, sales_count)
+
+        items = []
+        for edition_obj, sales_count in result:
+            edition_read = EditionRead.model_validate(edition_obj)
+            edition_read.sales_count = int(sales_count or 0)
+            items.append(edition_read)
 
         next_offset = offset + limit if (offset + limit) < total else None
         prev_offset = offset - limit if (offset - limit) >= 0 else None
@@ -59,8 +73,6 @@ def get_editions(
             status_code=500,
             detail="Error de base de datos al listar ediciones"
         )
-
-
 def get_edition(db: Session, edition_id: int):
     edition = db.query(Edition).filter(Edition.id == edition_id).first()
     if edition is None:

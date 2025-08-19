@@ -1,13 +1,13 @@
 import logging
-from typing import Any, Dict, Optional
+from typing import Optional
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from fastapi import HTTPException, status
 from models.sale import Sale # pylint: disable=import-error
 from models.edition import Edition # pylint: disable=import-error
 from models.customer import Customer # pylint: disable=import-error
-from schemas.sale import SaleCreate, SaleUpdate, SaleRead # pylint: disable=import-error
+from schemas.sale import SaleCreate, SaleListResponse, SaleUpdate, SaleRead # pylint: disable=import-error
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ def get_sales(
     db: Session,
     limit: int = 100,
     offset: int = 0
-) -> Dict[str, Any]:
+) -> SaleListResponse:
     """
     Listar ventas con paginación.
     Retorna dict con keys: items, total, limit, offset, next_offset, prev_offset
@@ -63,7 +63,102 @@ def get_sales(
         logger.exception("Error al listar ventas")
         raise HTTPException(status_code=500, detail="Error de base de datos al listar ventas")
 
+def get_sales_edition(
+    db: Session,
+    edition_id: int,
+    *,
+    customer_q: Optional[str] = None,
+    payment_status: Optional[str] = None,
+    payment_transfer: Optional[bool] = None,
+    delivered: Optional[bool] = None,
+    delivery: Optional[bool] = None,
+    freeze: Optional[bool] = None,
+    saved: Optional[bool] = None,
+    limit: int = 100,
+    offset: int = 0
+) -> SaleListResponse:
+    """
+    Listar ventas con paginación, filtradas por edition_id y opcionalmente por:
+      - customer_q (nombre del cliente, buscado con ILIKE)
+      - payment_status (string, ej. "PENDING" / "PAID")
+      - payment_transfer (bool)
+      - delivered (bool)
+      - delivery (bool)
+      - freeze (bool)
+      - saved (bool)
 
+    Retorna SaleListResponse (items, total, limit, offset, next_offset, prev_offset).
+    """
+    try:
+        # base statement
+        stmt = select(Sale)
+
+        # filtro por edición (requerido)
+        stmt = stmt.where(Sale.edition_id == edition_id)
+
+        # filtro por nombre del cliente (usa la relación Customer)
+        if customer_q:
+            term = f"%{customer_q.strip()}%"
+            # filtra usando existencia de customer con nombre coincidente
+            stmt = stmt.where(Sale.customer.has(Customer.name.ilike(term)))
+
+        # filtros directos por columnas
+        if payment_status is not None:
+            stmt = stmt.where(Sale.payment_status == payment_status)
+
+        if payment_transfer is not None:
+            stmt = stmt.where(Sale.payment_transfer == payment_transfer)
+
+        if delivered is not None:
+            stmt = stmt.where(Sale.delivered == delivered)
+
+        if delivery is not None:
+            stmt = stmt.where(Sale.delivery == delivery)
+
+        if freeze is not None:
+            stmt = stmt.where(Sale.freeze == freeze)
+
+        if saved is not None:
+            stmt = stmt.where(Sale.saved == saved)
+
+        # total sobre la consulta filtrada
+        count_stmt = select(func.count()).select_from(stmt.subquery())  # pylint: disable=not-callable
+        total = db.execute(count_stmt).scalar_one()
+
+        # traer filas (con las relaciones necesarias eager-loaded para pydantic)
+        rows_stmt = (
+            stmt
+            .options(
+                joinedload(Sale.customer),  # traer customer si SaleRead lo necesita
+                joinedload(Sale.edition),
+            )
+            .order_by(Sale.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        rows = db.execute(rows_stmt).scalars().all()
+
+        items = [SaleRead.model_validate(r) for r in rows]
+
+        next_offset = offset + limit if (offset + limit) < total else None
+        prev_offset = offset - limit if (offset - limit) >= 0 else None
+
+        return {
+            "items": items,
+            "total": int(total),
+            "limit": limit,
+            "offset": offset,
+            "next_offset": next_offset,
+            "prev_offset": prev_offset,
+        }
+    except SQLAlchemyError:
+        logger.exception(
+            "Error al listar ventas para edition_id=%s customer_q=%s payment_status=%s payment_transfer=%s delivered=%s delivery=%s freeze=%s saved=%s",
+            edition_id, customer_q, payment_status, payment_transfer, delivered, delivery, freeze, saved
+        )
+        raise HTTPException(status_code=500, detail="Error de base de datos al listar ventas")
+
+    
 def get_sale(db: Session, sale_id: int):
     sale = db.query(Sale).filter(Sale.id == sale_id).first()
     if sale is None:
@@ -81,10 +176,15 @@ def create_sale(db: Session, sale: SaleCreate):
     if customer is None:
         raise HTTPException(status_code=404, detail="Customer not found")
 
+    # 1.1) validar portion_price si lo usas para calcular total
+    if edition.portion_price is None:
+        raise HTTPException(status_code=400, detail="La edición no tiene portion_price definido")
+
+    # 2) validar business rules
     if sale.total_portions < 0:
         raise HTTPException(status_code=400, detail="total_portions debe ser >= 0")
 
-    # 2) calcular total en backend (ignorar lo que envía el cliente)
+    # 3) calcular total en backend (ignorar lo que envía el cliente)
     total_amount = _compute_total_amount(
         portions=sale.total_portions,
         edition_price=edition.portion_price,
@@ -92,7 +192,19 @@ def create_sale(db: Session, sale: SaleCreate):
         additional_cost=sale.additional_cost
     )
 
-    # 3) crear objeto DB — sobreescribimos total_amount
+    # 4) prevenir duplicados (UX) — aún así la constraint DB protege de race conditions
+    existing = (
+        db.query(Sale)
+        .filter(Sale.edition_id == sale.edition_id, Sale.customer_id == sale.customer_id)
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="El cliente ya tiene una compra registrada para esta edición"
+        )
+
+    # 5) construir payload sobrescribiendo total_amount
     payload = sale.model_dump(exclude={"total_amount"})
     payload["total_amount"] = total_amount
 
@@ -102,12 +214,22 @@ def create_sale(db: Session, sale: SaleCreate):
         db.commit()
         db.refresh(db_sale)
         return SaleRead.model_validate(db_sale)
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
-        logger.exception("Integrity error creando venta")
+        logger.exception("Integrity error creando venta: %s", exc)
+
+        # intentar detectar duplicate key / unique violation
+        orig = getattr(exc, "orig", None)
+        msg = str(orig).lower() if orig is not None else str(exc).lower()
+        if "uq_sale_edition_customer" in msg or "duplicate key" in msg or "unique constraint" in msg or "23505" in msg:
+            # unique constraint fired -> conflicto
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="El cliente ya tiene una compra registrada para esta edición (constraint)"
+            )
+
+        # otros errores de integridad
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Error de integridad al crear la venta")
-
-
 
 
 def update_sale(db: Session, sale_id: int, sale: SaleUpdate):

@@ -22,6 +22,8 @@ class SaleBase(BaseModel):
     )
     payment_transfer: bool = False
     delivered: bool = False
+    delivery: bool = False
+    freeze: bool = False
     saved: bool = False
     additional_cost: Optional[float] = Field(None, ge=0)
     sold_by: Optional[int] = None
@@ -41,6 +43,8 @@ class SaleUpdate(BaseModel):
     payment_status: Optional[PaymentStatus] = None
     payment_transfer: Optional[bool] = None
     delivered: Optional[bool] = None
+    delivery: Optional[bool] = None
+    freeze: Optional[bool] = None
     saved: Optional[bool] = None
     additional_cost: Optional[float] = Field(None, ge=0)
     sold_by: Optional[int] = None

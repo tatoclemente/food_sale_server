@@ -1,3 +1,4 @@
+from enum import Enum
 import datetime as datetime_first
 from datetime import date, datetime
 from typing import List, Optional
@@ -7,6 +8,11 @@ from schemas.preview import EditionIngredientPreview # pylint: disable=import-er
 
 # from schemas.edition_ingredient import EditionIngredientRead # pylint: disable=import-error
 
+class EditionStatus(str, Enum):
+    PENDING = "PENDING"
+    ACTIVE = "ACTIVE"
+    FINISHED = "FINISHED"
+    CANCELLED = "CANCELLED"
 
 # -----------------------
 # Base (validaciones comunes)
@@ -16,6 +22,7 @@ class EditionBase(BaseModel):
     name: str = Field(..., min_length=1, description="Nombre de la edición (ej. 'Locro Agosto 2025')")
     portion_price: float = Field(..., ge=0, description="Precio por porción (>= 0)")
     notes: Optional[str] = Field(None, description="Notas opcionales")
+    status: EditionStatus = Field(EditionStatus.PENDING, description="Estado de la edición")
 
     # Permite aceptar strings ISO (ej. '2025-08-01') o objetos date
     @field_validator("date", mode="before")
@@ -47,7 +54,8 @@ class EditionUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1)
     portion_price: Optional[float] = Field(None, ge=0)
     notes: Optional[str] = None
-
+    status: Optional[EditionStatus] = None 
+    
     @field_validator("date", mode="before")
     def parse_date(cls, v): # pylint: disable=no-self-argument
         if v is None:
