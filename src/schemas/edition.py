@@ -4,8 +4,6 @@ from datetime import date, datetime
 from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator
 
-from schemas.preview import EditionIngredientPreview # pylint: disable=import-error
-
 # from schemas.edition_ingredient import EditionIngredientRead # pylint: disable=import-error
 
 class EditionStatus(str, Enum):
@@ -76,7 +74,8 @@ class EditionRead(EditionBase):
     created_at: Optional[datetime] = None
     # Campo conveniente para dashboard (opcional)
     sales_count: Optional[int] = None
-    edition_items: List[EditionIngredientPreview] = []
+    edition_costs: float = 0.0          # <-- default 0.0
+    net_profits: Optional[float] = None
     model_config = {"from_attributes": True}
     
 class EditionListResponse(BaseModel):

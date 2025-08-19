@@ -14,11 +14,11 @@ from schemas.edition_ingredient import (  # pylint: disable=import-error, unused
 router = APIRouter()
 
 
-@router.get("/", 
+@router.get("/{edition_id}", 
             response_model=EditionIngredientListResponse, 
             summary="Listar ingredientes por edición")
 def list_edition_ingredients(
-    edition_id: Optional[int] = Query(None, description="Filtrar por edition_id"),
+    edition_id: int,
     q: Optional[str] = Query(None, description="Término de búsqueda (notes)"),
     categories: Optional[str] = Query(None, description="Filtrar por categorías (MEAT,VEGETABLES)"),
     limit: int = Query(100, ge=1, le=1000, description="Máximo resultados a devolver"),

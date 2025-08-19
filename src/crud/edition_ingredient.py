@@ -4,7 +4,7 @@ from enum import Enum as PyEnum
 from typing import List, Optional
 from datetime import datetime, timezone
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from fastapi import HTTPException, status
@@ -111,7 +111,8 @@ def _parse_categories_param(categories_param: Optional[str]) -> Optional[List[Ca
 
 def get_edition_ingredients(
     db: Session,
-    edition_id: Optional[int] = None,
+    edition_id: int,
+    *,
     q: Optional[str] = None,
     categories: Optional[str] = None,
     limit: int = 100,
@@ -119,45 +120,58 @@ def get_edition_ingredients(
 ) -> EditionIngredientListResponse:
     """
     Lista los ingredientes de ediciones (opcional: filtrar por edition_id).
-    Busca por notes si q está presente.
-    Además retorna totales por categoría y el total de gastos (purchases).
+    Busca por notes y por nombre del ingrediente si q está presente.
+    Retorna totales por categoría y el total de gastos (purchases).
+    Resultados siempre ordenados por categoría y luego por fecha (más nuevo primero).
     """
     try:
-        
         parsed_categories = _parse_categories_param(categories)
-        
+
+        # Base query: tomamos EditionIngredient y cargamos relaciones útiles.
         base_q = db.query(EditionIngredient).options(
             joinedload(EditionIngredient.ingredient),
             joinedload(EditionIngredient.edition),
             joinedload(EditionIngredient.purchase),
         )
 
-        # aplicar filtros
+        # Necesitamos el join a Ingredient para buscar por nombre y ordenar por categoría.
+        base_q = base_q.join(Ingredient, Ingredient.id == EditionIngredient.ingredient_id)
+
+        # filtros comunes
         if edition_id is not None:
             base_q = base_q.filter(EditionIngredient.edition_id == edition_id)
 
+        if parsed_categories is not None:
+            base_q = base_q.filter(Ingredient.category.in_(parsed_categories))
+
         if q:
             term = f"%{q.strip()}%"
-            base_q = base_q.filter(EditionIngredient.notes.ilike(term))
-        
-        if parsed_categories is not None:
-            # SQLAlchemy puede comparar Enum column con Python Enum instances
-            base_q = base_q.join(Ingredient, Ingredient.id == EditionIngredient.ingredient_id).filter(
-                Ingredient.category.in_(parsed_categories)
+            base_q = base_q.filter(
+                or_(
+                    EditionIngredient.notes.ilike(term),
+                    Ingredient.name.ilike(term)
+                )
             )
 
-        # total count (paginación)
-        total = base_q.count()
+        # total count con distinct para evitar duplicados por joins
+        total = int(
+            base_q.with_entities(func.count(func.distinct(EditionIngredient.id))).scalar() or 0
+        )
 
-        # filas paginadas
-        rows = base_q.order_by(EditionIngredient.created_at.desc()).offset(offset).limit(limit).all()
+        # filas paginadas, ordenadas por categoría (asc) y luego por fecha (desc)
+        rows = (
+            base_q
+            .order_by(Ingredient.category.asc(), EditionIngredient.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
 
         items = [_make_read_from_instance(r) for r in rows]
 
         # ---------------------------
         # Totales por categoría
         # ---------------------------
-        # join Ingredient para agrupar por category
         cat_q = db.query(
             Ingredient.category.label("category"),
             func.coalesce(func.sum(EditionIngredient.subtotal), 0.0).label("total")
@@ -169,36 +183,51 @@ def get_edition_ingredients(
         # aplicar mismos filtros que en base_q
         if edition_id is not None:
             cat_q = cat_q.filter(EditionIngredient.edition_id == edition_id)
+        if parsed_categories is not None:
+            cat_q = cat_q.filter(Ingredient.category.in_(parsed_categories))
         if q:
-            cat_q = cat_q.filter(EditionIngredient.notes.ilike(term))
+            # reutilizamos el mismo término de búsqueda
+            cat_q = cat_q.filter(
+                or_(
+                    EditionIngredient.notes.ilike(term),
+                    Ingredient.name.ilike(term)
+                )
+            )
 
-        cat_q = cat_q.group_by(Ingredient.category)
+        cat_q = cat_q.group_by(Ingredient.category).order_by(Ingredient.category.asc())
         cat_rows = cat_q.all()
 
         # normalizar a lista de dicts
         category_totals = []
         for cat, tot in cat_rows:
-            # si cat es un Enum, tomar .value o .name; si no, fallback a str(cat)
             if isinstance(cat, PyEnum):
-                label = cat.value  # o cat.name si preferís el nombre del enum
+                label = cat.value
             else:
                 label = str(cat)
             category_totals.append({"category": label, "total": float(tot or 0.0)})
+
         # ---------------------------
         # Total de subtotales (ingredientes)
         # ---------------------------
-        total_sub_q = db.query(func.coalesce(func.sum(EditionIngredient.subtotal), 0.0))
+        total_sub_q = db.query(func.coalesce(func.sum(EditionIngredient.subtotal), 0.0)).join(
+            Ingredient, Ingredient.id == EditionIngredient.ingredient_id
+        )
         if edition_id is not None:
             total_sub_q = total_sub_q.filter(EditionIngredient.edition_id == edition_id)
+        if parsed_categories is not None:
+            total_sub_q = total_sub_q.filter(Ingredient.category.in_(parsed_categories))
         if q:
-            total_sub_q = total_sub_q.filter(EditionIngredient.notes.ilike(term))
+            total_sub_q = total_sub_q.filter(
+                or_(
+                    EditionIngredient.notes.ilike(term),
+                    Ingredient.name.ilike(term)
+                )
+            )
         ingredients_total = float(total_sub_q.scalar() or 0.0)
 
         # ---------------------------
         # Total de gastos (purchases)
         # ---------------------------
-        # Si pasaron edition_id, sumamos purchases para esa edición.
-        # Si no, devolvemos la suma total de purchases (podés cambiar esto si preferís None en ese caso).
         expenses_q = db.query(func.coalesce(func.sum(Purchase.total_amount), 0.0))
         if edition_id is not None:
             expenses_q = expenses_q.filter(Purchase.edition_id == edition_id)

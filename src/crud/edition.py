@@ -6,6 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from fastapi import HTTPException, status
 
 from models.edition import Edition # pylint: disable=import-error
+from models.edition_ingredient import EditionIngredient # pylint: disable=import-error
 from models.sale import Sale # pylint: disable=import-error
 from schemas.edition import EditionCreate, EditionListResponse, EditionUpdate, EditionRead # pylint: disable=import-error
 
@@ -20,8 +21,10 @@ def get_editions(
 ) -> EditionListResponse:
     """
     Búsqueda con paginación (limit/offset) y total.
-    Además incluye sales_count (suma de total_portions) por edición.
-    Retorna dict con keys: items, total, limit, offset, next_offset, prev_offset
+    Incluye:
+      - sales_count: SUM(Sale.total_portions)
+      - edition_costs: SUM(EditionIngredient.subtotal)
+      - net_profits: (sales_count * portion_price) - edition_costs
     """
     try:
         # construir filtros base
@@ -35,25 +38,63 @@ def get_editions(
         count_stmt = select(func.count()).select_from(base_count_stmt.subquery())  # pylint: disable=not-callable
         total = db.execute(count_stmt).scalar_one()
 
-        # agregamos la agregación: SUM of total_portions
-
-        # use COALESCE to return 0 when there are no sales
-        portions_sum = func.coalesce(func.sum(Sale.total_portions), 0).label("sales_count")
-
-        rows_stmt = (
-            select(Edition, portions_sum)
-            .outerjoin(Sale, Sale.edition_id == Edition.id)
-            .where(*filters) if filters else select(Edition, portions_sum).outerjoin(Sale, Sale.edition_id == Edition.id)
+        # subquery: sum of total_portions por edition
+        sales_subq = (
+            select(
+                Sale.edition_id.label("edition_id"),
+                func.coalesce(func.sum(Sale.total_portions), 0).label("sales_count"),
+            )
+            .group_by(Sale.edition_id)
+            .subquery()
         )
 
-        rows_stmt = rows_stmt.group_by(Edition.id).order_by(Edition.date.desc()).offset(offset).limit(limit)
+        costs_subq = (
+            select(
+                EditionIngredient.edition_id.label("edition_id"),
+                func.coalesce(func.sum(EditionIngredient.subtotal), 0).label("edition_costs"),
+            )
+            .group_by(EditionIngredient.edition_id)
+            .subquery()
+        )
 
-        result = db.execute(rows_stmt).all()  # lista de tuples (Edition, sales_count)
+        # select principal: Edition + sales_count + edition_costs (ambos opcionales por LEFT JOIN)
+        rows_stmt = (
+            select(Edition, sales_subq.c.sales_count, costs_subq.c.edition_costs)
+            .outerjoin(sales_subq, sales_subq.c.edition_id == Edition.id)
+            .outerjoin(costs_subq, costs_subq.c.edition_id == Edition.id)
+        )
+
+        # aplicar filtros si existen
+        if filters:
+            rows_stmt = rows_stmt.where(*filters)
+
+        rows_stmt = rows_stmt.order_by(Edition.date.desc()).offset(offset).limit(limit)
+
+        result = db.execute(rows_stmt).all()  # lista de tuples (Edition, sales_count, edition_costs)
 
         items = []
-        for edition_obj, sales_count in result:
+        for edition_obj, sales_count_raw, edition_costs_raw in result:
             edition_read = EditionRead.model_validate(edition_obj)
-            edition_read.sales_count = int(sales_count or 0)
+
+            # normalizar valores
+            sales_count = int(sales_count_raw or 0)
+
+            edition_costs_f = float(edition_costs_raw or 0.0)
+            # como tu schema pide int, redondeo a entero (ajustalo si preferís float)
+            edition_costs_int = int(round(edition_costs_f))
+
+            # net_profits: si no hay portion_price devolvemos None (mantengo la misma lógica que sugeriste antes)
+            if edition_obj.portion_price is None:
+                net_profits_val = None
+            else:
+                revenue = float(sales_count) * float(edition_obj.portion_price)
+                net_profit_f = revenue - edition_costs_f
+                net_profits_val = int(round(net_profit_f))
+
+            edition_read.sales_count = sales_count
+            edition_read.edition_costs = edition_costs_int
+            edition_read.net_profits = net_profits_val
+
             items.append(edition_read)
 
         next_offset = offset + limit if (offset + limit) < total else None
@@ -73,11 +114,45 @@ def get_editions(
             status_code=500,
             detail="Error de base de datos al listar ediciones"
         )
+
+
 def get_edition(db: Session, edition_id: int):
     edition = db.query(Edition).filter(Edition.id == edition_id).first()
     if edition is None:
         raise HTTPException(status_code=404, detail="Edition not found")
-    return EditionRead.model_validate(edition)
+
+    try:
+        # sales_count: SUM de total_portions para esta edition
+        sales_count_stmt = select(func.coalesce(func.sum(Sale.total_portions), 0)).where(Sale.edition_id == edition_id)
+        sales_count = db.execute(sales_count_stmt).scalar_one() or 0
+
+        # edition_costs: SUM de subtotales de los edition_items para esta edition
+        costs_stmt = select(func.coalesce(func.sum(EditionIngredient.subtotal), 0)).where(EditionIngredient.edition_id == edition_id)
+        edition_costs_raw = db.execute(costs_stmt).scalar_one() or 0.0
+        # normalizamos a float y redondeamos
+        edition_costs = round(float(edition_costs_raw), 2)
+
+        # net_profits: ingresos - costos
+        if edition.portion_price is None:
+            net_profits = None
+        else:
+            revenue = float(sales_count) * float(edition.portion_price)
+            net_profits = round(revenue - edition_costs, 2)
+
+        # construir response Pydantic
+        edition_read = EditionRead.model_validate(edition)
+        edition_read.sales_count = int(sales_count)
+        edition_read.edition_costs = edition_costs
+        edition_read.net_profits = net_profits
+
+        return edition_read
+
+    except SQLAlchemyError:
+        logger.exception("Error al obtener edition %s", edition_id)
+        raise HTTPException(
+            status_code=500,
+            detail="Error de base de datos al obtener edición"
+        )
 
 
 def create_edition(db: Session, edition: EditionCreate):
