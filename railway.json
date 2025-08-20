@@ -4,6 +4,6 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "fastapi run src/main.py"
+    "startCommand": "hypercorn main:app --bind \"[::]:$PORT\""
   }
 }
